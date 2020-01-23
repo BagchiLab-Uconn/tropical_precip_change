@@ -1,0 +1,138 @@
+---
+title: "Analysis of precipitation trends"
+author: "Robert Bagchi"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: pdf_document
+number_sections: yes
+toc: true
+---
+
+```{r packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(tidyselect)
+library(reshape2)
+library(sf)
+library(raster)
+library(ggthemes)
+library(rnaturalearth)
+library(ggspatial)
+```
+
+Get precipitation data from Worldclim and coastline from Natural Earth. 
+
+```{r getData}
+world <- ne_coastline(scale = "medium", returnclass = "sf")
+
+res <- "2.5"; rcp <- "8.5"
+webres <- "2_5"; webrcp <- "85"
+
+bio2000_file <- paste0("../data/wc2.0_", res, "m_bio_1970-2000.zip")
+if(!file.exists(bio2000_file))
+  download.file(
+    paste0(
+      "http://biogeo.ucdavis.edu/data/worldclim/v2.0/tif/base/wc2.0_",
+      res, "m_bio.zip"), 
+    destfile = bio2000_file)
+unzip(bio2000_file, files = paste0("wc2.0_bio_", res, "m_12.tif"),  
+      overwrite = FALSE, exdir = "../data" )
+
+prec_2000 <- raster(paste0("../data/wc2.0_bio_", res, "m_12.tif"))
+
+gcms <- list("ac", "bc", "cc", "cn", "gf", "gs", "hd", "he", "hg", 
+              "in", "ip", "mc","mg", "mi", "mp", "mr", "no")
+length(gcms)
+
+sapply(gcms, function(g){
+  bio2070_file <- paste0("../data/cmip5/", res, "m/rcp", rcp, "/", 
+                         g, rcp, "bi7012.zip")
+  if(!file.exists(bio2070_file))
+    download.file(
+      paste0("http://biogeo.ucdavis.edu/data/climate/cmip5/", webres, "m/",
+             g, webrcp,"bi70.zip"), 
+      destfile = bio2070_file)
+  unzip(bio2070_file, files = paste0(g, webrcp, "bi70", "12.tif"),  
+        overwrite = FALSE, 
+        exdir = paste0("../data/cmip5/", res, "m/rcp", rcp))
+})
+lapply(gcms,  function(gcm)
+  paste0("../data/cmip5/", res, "m/rcp", rcp, "/", gcm, webrcp,"bi7012.tif"))
+
+```
+
+Organise the data as raster layers.
+
+```{r rasterprep}
+prec_2070 <- stack(lapply(gcms,  function(gcm)
+  raster(paste0("../data/cmip5/", res, "m/rcp", rcp, "/", 
+                gcm, webrcp,"bi7012.tif"))))
+
+prec_2000 <- crop(prec_2000, extent(prec_2070[[1]]))
+prec_2070 <-  stack(stack(prec_2000), prec_2070)
+names(prec_2070) <- paste0("pr_", c("pres", paste0("fut_", unlist(gcms))))
+```
+
+Convert to data frames and then calculate metrics. For the paper, we only present a simple metric from Malhi et al 2008, Science. However, also estimate some other metrics here - the overall patterns are very similar.
+
+```{r calcMetrics}
+tropbounds <- list(x=c(-120, 180), y=c(-25, 25))
+## get data from with each GCM in a column
+tropprec_df <- prec_2070 %>% crop(extent(tropbounds)) %>%
+  as.data.frame(xy=TRUE) %>% 
+  melt(id.vars=c("x", "y")) %>%  filter(!is.na(value)) %>% 
+  spread(key = variable, value = value)
+
+## future columns
+futcols <- vars_select(names(tropprec_df), starts_with("pr_fut"))
+
+tropprec_df$pr_fut <- apply(tropprec_df[,futcols], 1, mean) # mean future
+tropprec_df$pr_fut_sd <- apply(tropprec_df[,futcols], 1, sd) # sd future
+
+tropprec_df <- tropprec_df %>% mutate(r_pr_fut = pr_fut/pr_pres) ## ratio fut/pres
+
+## get some locations with 0/0, which are no change, so 1
+tropprec_df$r_pr_fut[tropprec_df$pr_pres == 0 & tropprec_df$pr_fut==0] <- 1
+
+## z score of change, converted to a probability (experimental).
+tropprec_df <- tropprec_df %>% mutate(t_pr_fut = pnorm((pr_fut - pr_pres)/pr_fut_sd))
+
+## set to 0.5 (i.e. no difference) when there is no difference between
+## present and future and no variation among future projections.
+tropprec_df$t_pr_fut[apply(tropprec_df[, c("pr_pres", futcols)], 
+                           1, function(x) var(x)==0)] <- 0.5
+
+## rank of present precip in grid squre compared to projections of 
+## future precip in grid squre
+## This is the metric used in the paper
+tropprec_df$rank_pr_fut <- apply(tropprec_df[,c("pr_pres", futcols)], 1, 
+                                 function(x) mean(x[1] < x[-1]))
+```
+
+Plotting the projected change in precipitation on a map of the tropics. 
+
+```{r globalmap}
+precip_change <-  ggplot() +
+  geom_tile(data=filter(tropprec_df, !is.na(t_pr_fut)), 
+                          aes(x=x, y=y, fill=t_pr_fut)) +
+  geom_sf(data=world, col=NA, fill=NA, size=0.7) +
+  coord_sf(xlim = tropbounds$x, ylim = tropbounds$y, expand = FALSE) +
+  annotation_scale(location = "bl", width_hint = 0.08) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.12, "in"), pad_y = unit(0.25, "in"), 
+                         style = north_arrow_nautical) +
+  scale_fill_distiller(type="div", direction = 1, limit=c(0, 1)) +
+  scale_x_continuous(breaks=seq(-180, 180,20)) +
+  scale_y_continuous(breaks=seq(-24, 24, 8)) +
+  labs(x="", y="", fill="Pr(Increased Annual \nPrecipitation)") +
+  theme_tufte() +  theme(
+    panel.grid.major = element_line(color = gray(0.8), linetype = "dashed", 
+                                    size = 0.5), 
+    panel.background = element_rect(fill = "aliceblue"), 
+    plot.margin = unit(c(0.5, 1, 0, 1), "cm"), 
+    legend.title=element_text(size=9))
+
+precip_change
+
+ggsave("../figures/world_precip_change_pz2_rcp8.5.png", precip_change,
+                 dpi=600, height =4, width=10, units="in")
+
+```
